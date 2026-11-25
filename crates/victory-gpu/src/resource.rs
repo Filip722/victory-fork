@@ -1415,7 +1415,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             let cut = reserved
                 .as_ref()
                 .zip(crate::host::host())
-                .and_then(|(t, host)| crate::tiles::Tiled::make(&host.device, t, u32::from(r.desc.mip_levels)));
+                .and_then(|(t, host)| crate::tiles::Tiled::make(&host.device, t));
             // (Both or neither: a reserved texture the card will not cut
             // into tiles is dropped here, and the old kind is made below.)
             if cut.is_some() {
@@ -4106,6 +4106,63 @@ float4 lit() : SV_Target { return 1.0; }
             let drawn = matches!(class, 65 | 129);
             assert_eq!(covered, drawn, "texel {i}, class {class}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "run on a tiled-resources device with VICTORY_LEVELS_ON_DEMAND=1 and VICTORY_TEXTURE_DROP_MIPS=1"]
+    fn dropped_mips_keep_retained_levels_on_demand() {
+        use windows_sys::Win32::System::Memory::*;
+
+        let host = crate::host::host().expect("D3D12 device");
+        assert!(crate::tiles::wanted(), "enable levels on demand");
+        let desc = texture(1024, 1024, 98, 3); // BC7
+        assert_eq!(drop_levels(&desc), 1, "drop just the largest mip");
+        let layout = &texture_layout(&desc).unwrap().planes[0].layout;
+        let dropped_start = layout.mips[0].offset as usize;
+        assert!(dropped_start.is_multiple_of(4096) && dropped_start != 0);
+        // Reserve the title layout, but commit only the two smaller mips.
+        // SAFETY: this allocation belongs to the fixture and is held through
+        // submission; only its committed prefix is written.
+        let base = unsafe {
+            let base = VirtualAlloc(std::ptr::null(), layout.size as usize, MEM_RESERVE, PAGE_NOACCESS);
+            assert!(!base.is_null());
+            assert_eq!(VirtualAlloc(base, dropped_start, MEM_COMMIT, PAGE_READWRITE), base);
+            base.cast::<u8>().write_bytes(0x6c, dropped_start);
+            base
+        };
+        let null = std::ptr::null();
+        let mut placed = null;
+        assert_eq!(
+            create_at_address(null, base as u64, &desc, u32::MAX, null.cast(), &RESOURCE_IIDS[0], &mut placed),
+            S_OK,
+        );
+        // Match texture_at's marking without keeping this resource in its
+        // permanent address registry.
+        resource(placed).host.placed.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let copy = host_resource(placed).expect("host texture");
+        // SAFETY: `copy` is a live texture.
+        assert_eq!(unsafe { copy.GetDesc() }.MipLevels, 2);
+        let demand = host_tiled(placed).expect("the reduced texture must stay reserved");
+        let tiled = demand.tiled().expect("texture tiling");
+        assert_eq!(tiled.every_level(), 0b11, "two host mip levels");
+        assert_eq!(tiled.given_bytes(), 0);
+
+        let upload = host.new_list().unwrap();
+        crate::texture::upload(&upload, placed, &copy);
+        upload.close();
+        host.execute(&[&upload]);
+        assert_eq!(tiled.first_shown(), Some(0), "the retained large mip is host mip zero");
+        assert!(tiled.given_bytes() >= 320 * 1024, "both BC7 mips must get memory");
+        // SAFETY: a live device and a completed submission.
+        unsafe { host.device.GetDeviceRemovedReason() }.unwrap();
+
+        drop(upload);
+        drop(demand);
+        assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+        // SAFETY: the fixture has released the resource using this memory.
+        assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
     }
 
     #[test]

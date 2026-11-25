@@ -274,11 +274,13 @@ pub(crate) struct Tiled {
 }
 
 impl Tiled {
-    /// For `texture`, just made reserved with `levels` levels and one
+    /// For `texture`, just made reserved with one
     /// layer: how the card cuts it into tiles. `None` if the card will not
     /// say, or cuts it in a way this does not handle; the caller then makes
     /// the texture the old way.
-    pub(crate) fn make(device: &ID3D12Device, texture: &ID3D12Resource, levels: u32) -> Option<Tiled> {
+    pub(crate) fn make(device: &ID3D12Device, texture: &ID3D12Resource) -> Option<Tiled> {
+        // SAFETY: a live, single-layer host texture.
+        let levels = u32::from(unsafe { texture.GetDesc() }.MipLevels);
         if levels == 0 || levels > 16 {
             return None;
         }
@@ -997,7 +999,7 @@ void look() {
             self.check("a texture without memory made");
             asked.expect("a reserved texture");
             let texture = made.expect("a reserved texture");
-            let tiled = Tiled::make(&self.device, &texture, u32::from(desc.MipLevels)).expect("the card says how it cuts the texture");
+            let tiled = Tiled::make(&self.device, &texture).expect("the card says how it cuts the texture");
             (texture, tiled)
         }
 

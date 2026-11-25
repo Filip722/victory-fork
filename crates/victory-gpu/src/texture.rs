@@ -895,7 +895,9 @@ impl Staging {
                 }
             }
         }
-        held
+        // Tile allocation and staging footprints number the host's
+        // retained mips from zero.
+        held >> self.drop
     }
 
     /// Forgets what the staging buffer was last filled from: the next
