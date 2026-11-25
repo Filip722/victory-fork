@@ -1284,8 +1284,8 @@ fn fills(desc: &ResourceDesc) -> bool {
 /// on their shorter side, whose sides the levels left out halve exactly
 /// into whole 4-texel blocks: host level `m` is then title level `m + N`
 /// texel for texel. Shaders see the texture at half the size per level
-/// left out: views shift their levels ([`shift_levels`]), and copies
-/// between such a texture and another are skipped (`list.rs` `unlike`).
+/// left out: views shift their levels ([`shift_levels`]), and region copies
+/// use the retained levels' host indices ([`host_subresource`]).
 #[cfg(windows)]
 pub(crate) fn drop_levels(desc: &ResourceDesc) -> u32 {
     const TEXTURE_2D: u32 = 3;
@@ -3428,6 +3428,229 @@ mod tests {
             let at = row * 256;
             assert_eq!(read[at..at + 16], bytes[at..at + 16], "row {row}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires a D3D12 device and VICTORY_TEXTURE_DROP_MIPS=1"]
+    fn copies_retained_texture_regions_at_the_host_subresources() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::core::Interface;
+
+        let host = crate::host::host().expect("D3D12 device");
+        let null = std::ptr::null();
+        let create = |desc: ResourceDesc| {
+            let mut image = null;
+            assert_eq!(
+                create_committed(
+                    null,
+                    &PROPERTIES,
+                    0,
+                    &desc,
+                    0x400,
+                    null.cast(),
+                    &RESOURCE_IIDS[0],
+                    &mut image
+                ),
+                S_OK
+            );
+            image
+        };
+        let reduced = create(ResourceDesc {
+            depth_or_array_size: 2,
+            ..texture(512, 512, 28, 3)
+        });
+        let small = texture(4, 4, 28, 1);
+        let (source, observed, excluded) = (create(small), create(small), create(small));
+        assert_eq!(dropped(reduced), 1, "enable one dropped mip");
+        // Mip 1 of slice 1 stays in the resource. Its title index is 4,
+        // and its host index is 2 because both slices lose one mip.
+        const RETAINED: u64 = 4;
+        const HOST_RETAINED: u64 = 2;
+        const DROPPED: u64 = 3;
+        const HOST_NEIGHBOR: u64 = DROPPED;
+        const SLOT: usize = 1024;
+        const PITCH: usize = 256;
+
+        #[repr(C)]
+        struct Location {
+            resource: This,
+            kind: u32,
+            footprint: PlacedFootprint,
+        }
+        let region = D3D12_BOX {
+            left: 0,
+            top: 0,
+            front: 0,
+            right: 4,
+            bottom: 4,
+            back: 1,
+        };
+        let location = |resource, kind, offset| Location {
+            resource,
+            kind,
+            footprint: PlacedFootprint {
+                offset,
+                format: 28,
+                width: 4,
+                height: 4,
+                depth: 1,
+                row_pitch: PITCH as u32,
+            },
+        };
+        let native = |r: &ID3D12Resource| r.as_raw().cast_const().cast();
+        let native_copy = |list: &crate::host::HostList, to: Location, from: Location, source_box| {
+            // SAFETY: these locations name live resources in the host layout.
+            unsafe {
+                list.list.CopyTextureRegion(
+                    (&raw const to).cast(),
+                    0,
+                    0,
+                    0,
+                    (&raw const from).cast(),
+                    source_box,
+                )
+            };
+        };
+        let (upload, data) = host.upload_buffer((4 * SLOT) as u64).unwrap();
+        let first = host.new_list().unwrap();
+        for (image, subresource, slot, byte) in [
+            (reduced, HOST_RETAINED, 0, 0x6c),
+            (source, 0, 1, 0x93),
+            (observed, 0, 2, 0x17),
+            (excluded, 0, 2, 0x17),
+            (reduced, HOST_NEIGHBOR, 3, 0x2b),
+        ] {
+            // SAFETY: one footprint's bytes in the upload mapping.
+            unsafe { data.add(slot * SLOT).write_bytes(byte, SLOT) };
+            let image_host = host_resource(image).unwrap();
+            native_copy(
+                &first,
+                location(native(image_host), 0, subresource),
+                location(native(&upload), 1, (slot * SLOT) as u64),
+                None,
+            );
+            crate::texture::host_written(image);
+        }
+        first.close();
+        host.execute(&[&first]);
+
+        let allocator_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        let (mut allocator, mut list) = (null, null);
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list),
+            S_OK
+        );
+        type Copy =
+            extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const D3D12_BOX);
+        let copy = slot::<Copy>(list, 0x80);
+        let ordinary_source = location(source, 0, 0);
+        let retained = location(reduced, 0, RETAINED);
+        let dropped_location = location(reduced, 0, DROPPED);
+        copy(
+            list,
+            &dropped_location,
+            0,
+            0,
+            0,
+            &ordinary_source,
+            null.cast(),
+        );
+        copy(list, &location(observed, 0, 0), 0, 0, 0, &retained, &region);
+        copy(
+            list,
+            &location(excluded, 0, 0),
+            0,
+            0,
+            0,
+            &dropped_location,
+            &region,
+        );
+        copy(list, &retained, 0, 0, 0, &ordinary_source, null.cast());
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
+            S_OK
+        );
+        host.execute(&[crate::list::host_list(list).unwrap()]);
+
+        let readback = host.read_back_buffer((4 * SLOT) as u64).unwrap();
+        let last = host.new_list().unwrap();
+        for (slot, image, subresource) in [
+            (0, observed, 0),
+            (1, reduced, HOST_RETAINED),
+            (2, excluded, 0),
+            (3, reduced, HOST_NEIGHBOR),
+        ] {
+            let image_host = host_resource(image).unwrap();
+            if let Some((_, before)) = host_transition(image, 0x800) {
+                // SAFETY: the resource and open list are live.
+                unsafe {
+                    last.list.ResourceBarrier(&[crate::host::transition(
+                        image_host,
+                        D3D12_RESOURCE_STATES(before as i32),
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )])
+                };
+            }
+            native_copy(
+                &last,
+                location(native(&readback), 1, (slot * SLOT) as u64),
+                location(native(image_host), 0, subresource),
+                Some(&region),
+            );
+        }
+        last.close();
+        host.execute(&[&last]);
+
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: all copies finished and the buffer holds four footprints.
+        let data = unsafe {
+            readback.Map(0, None, Some(&mut mapped)).unwrap();
+            std::slice::from_raw_parts(mapped.cast::<u8>(), 4 * SLOT)
+        };
+        let pixels = [0, 1, 2, 3].map(|slot| {
+            [0, 1, 2, 3].map(|row| {
+                let start = slot * SLOT + row * PITCH;
+                <[u8; 16]>::try_from(&data[start..start + 16]).unwrap()
+            })
+        });
+        // SAFETY: the mapping is no longer used.
+        unsafe { readback.Unmap(0, None) };
+        let release = |object: This| slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+        for object in [list, allocator, source, observed, excluded, reduced] {
+            release(object);
+        }
+        assert_eq!(
+            pixels[0], [[0x6c; 16]; 4],
+            "read from retained mip in slice 1"
+        );
+        assert_eq!(
+            pixels[1], [[0x93; 16]; 4],
+            "write to retained mip in slice 1"
+        );
+        assert_eq!(
+            pixels[2], [[0x17; 16]; 4],
+            "copy from an excluded mip leaves destination alone"
+        );
+        assert_eq!(
+            pixels[3], [[0x2b; 16]; 4],
+            "copy to an excluded mip leaves the host mip at the same index alone"
+        );
     }
 
     /// A 16-bit depth texture the title also asks unordered access for gets

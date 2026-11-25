@@ -955,22 +955,24 @@ extern "system" fn copy_buffer_region(
     let _ = (this, dst, dst_offset, src, src_offset, len);
 }
 
-/// Whether one of two resources is a target in a stand-in format and the
-/// other is not ([`crate::resource::target_format`]): their texels differ
-/// in size, so the host cannot copy between them (logged once).
+/// Whether a whole-resource copy or resolve cannot use these host copies.
 #[cfg(windows)]
-fn unlike(dst: This, src: This, from_buffer: bool) -> bool {
+fn unlike(dst: This, src: This) -> bool {
     // A host copy without its largest levels has other subresources and
-    // sizes than the title's texture (`crate::resource::drop_levels`): a
-    // copy from a buffer into it goes to the level it has
-    // (`crate::resource::host_subresource`), any other is skipped.
-    if crate::resource::dropped(src) > 0 || (!from_buffer && crate::resource::dropped(dst) > 0) {
+    // sizes than the title's texture (`crate::resource::drop_levels`).
+    if crate::resource::dropped(src) > 0 || crate::resource::dropped(dst) > 0 {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
             tracing::warn!(?dst, ?src, "copy with a texture whose host copy leaves out levels skipped")
         });
         return true;
     }
+    unlike_format(dst, src)
+}
+
+/// A stand-in target's texels differ in size from the title format.
+#[cfg(windows)]
+fn unlike_format(dst: This, src: This) -> bool {
     let unlike = crate::resource::stands_in(dst) != crate::resource::stands_in(src);
     if unlike {
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -991,7 +993,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
-            if unlike(dst, src, false) {
+            if unlike(dst, src) {
                 return;
             }
             // A source the title fills itself is uploaded first (upstream
@@ -1037,6 +1039,21 @@ pub(crate) struct CopyLocation {
     footprint: crate::resource::PlacedFootprint,
 }
 
+#[cfg(windows)]
+impl CopyLocation {
+    const FOOTPRINT: u32 = 1;
+
+    /// Maps a title texture subresource to its retained host mip.
+    fn retained(mut self) -> Option<Self> {
+        if self.kind != Self::FOOTPRINT && crate::resource::dropped(self.resource) > 0 {
+            let index =
+                crate::resource::host_subresource(self.resource, self.footprint.offset as u32)?;
+            self.footprint.offset = u64::from(index);
+        }
+        Some(self)
+    }
+}
+
 /// Texture to texture on the GPU; buffer to texture through an upload
 /// buffer filled at submission. Texture to buffer (read back) is not done
 /// yet.
@@ -1053,7 +1070,7 @@ extern "system" fn copy_texture_region(
     {
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
         use windows::core::Interface;
-        const FOOTPRINT: u32 = 1;
+        const FOOTPRINT: u32 = CopyLocation::FOOTPRINT;
         // SAFETY: the title passes both locations (null is tolerated).
         let (Some(list), Some(&dst), Some(&src)) =
             (host_list(this), unsafe { dst.as_ref() }, unsafe {
@@ -1096,18 +1113,17 @@ extern "system" fn copy_texture_region(
             }
             return;
         };
-        if unlike(dst.resource, src.resource, src.kind == FOOTPRINT) {
+        if unlike_format(dst.resource, src.resource) {
             return;
         }
-        // Into a host copy without its largest levels: the level it has,
-        // or nothing (`crate::resource::drop_levels`).
-        let mut dst = dst;
-        if dst.kind != FOOTPRINT && crate::resource::dropped(dst.resource) > 0 {
-            match crate::resource::host_subresource(dst.resource, dst.footprint.offset as u32) {
-                Some(index) => dst.footprint.offset = u64::from(index),
-                None => return,
-            }
+        // Same-texture copies would require separate source and destination
+        // states for the two subresources. Keep skipping these reduced copies.
+        if src.resource == dst.resource && crate::resource::dropped(src.resource) > 0 {
+            return;
         }
+        let (Some(dst), Some(src)) = (dst.retained(), src.retained()) else {
+            return;
+        };
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
@@ -1333,7 +1349,7 @@ extern "system" fn resolve(
         use windows::core::Interface;
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
-        if unlike(dst, src, false) {
+        if unlike(dst, src) {
             return;
         }
         // Depth textures shaders also write: what they wrote, first.
