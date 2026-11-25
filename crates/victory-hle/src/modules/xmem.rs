@@ -1558,17 +1558,22 @@ mod tests {
     }
 
     #[test]
-    fn chunked_allocation_materializes_lazily_and_splits_runs_at_chunks() {
+    fn physical_allocation_preserves_runs_across_the_chunk_boundary() {
         let total = CHUNK_PAGES + 2;
         let pages = allocate(total);
-        // Consecutive pages inside chunk 0 coalesce into one run; crossing into
-        // chunk 1 starts a second run.
+        let wine = on_wine();
+        // Wine makes one committed section. Native Windows materializes
+        // separate chunks, so only there does crossing a chunk start a new run.
         let r_chunk0 = runs(&pages, 0, CHUNK_PAGES * PAGE).expect("known");
         assert_eq!(r_chunk0.len(), 1);
         assert_eq!(r_chunk0[0].1, CHUNK_PAGES);
         let r_cross = runs(&pages, (CHUNK_PAGES - 1) * PAGE, 2 * PAGE).expect("known");
-        assert_eq!(r_cross.len(), 2);
-        assert_eq!((r_cross[0].1, r_cross[1].1), (1, 1));
+        let lengths = r_cross.iter().map(|run| run.1).collect::<Vec<_>>();
+        if wine {
+            assert_eq!(lengths, [2]);
+        } else {
+            assert_eq!(lengths, [1, 1]);
+        }
 
         let (chunk0, chunk1) = {
             let p = physical();
@@ -1577,14 +1582,16 @@ mod tests {
                 p.pages.get(&pages[CHUNK_PAGES]).expect("p1024").chunk.clone(),
             )
         };
-        assert!(!Arc::ptr_eq(&chunk0, &chunk1));
-        if !on_wine() {
+        assert_eq!(Arc::ptr_eq(&chunk0, &chunk1), wine);
+        if wine {
+            assert!(chunk0.section.lock().unwrap().as_ref().is_some_and(|s| s.committed));
+        } else {
             assert!(chunk0.section.lock().unwrap().is_none(), "chunk 0 starts lazy");
             assert!(chunk1.section.lock().unwrap().is_none(), "chunk 1 starts lazy");
         }
 
-        // Map only chunk 1's first page: chunk 0 stays unmaterialized on Windows,
-        // while chunk 1 materializes with SEC_COMMIT.
+        // Map the first page beyond the boundary. On native Windows only
+        // the second chunk is materialized.
         let reservation = XMemVirtualAlloc(
             std::ptr::null_mut(),
             2 * PAGE,
@@ -1598,13 +1605,13 @@ mod tests {
             reservation
         );
         assert_eq!(query(reservation).host.State, MEM_COMMIT);
-        if !on_wine() {
+        if !wine {
             assert!(chunk0.section.lock().unwrap().is_none(), "untouched chunk 0 remains lazy");
         }
         let sec1 = chunk1.section.lock().unwrap().clone().expect("chunk 1 materialized");
         assert!(sec1.committed);
 
-        // Write through View::map on chunk 1's second page and read via mapped view.
+        // Write via a physical page and read the same bytes from its mapping.
         assert!(write_physical(&pages[CHUNK_PAGES..], 0, &[0x3c; 16]));
         // SAFETY: mapped read-write.
         assert_eq!(unsafe { std::slice::from_raw_parts(reservation.cast::<u8>(), 16) }, &[0x3c; 16]);
