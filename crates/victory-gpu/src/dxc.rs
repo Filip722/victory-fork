@@ -27,6 +27,8 @@
 
 use std::path::PathBuf;
 
+use victory_shader::dxbc::{Container, FourCC};
+
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::Dxc::{
     CLSID_DxcCompiler, DXC_CP_UTF8, DxcBuffer, IDxcCompiler3, IDxcIncludeHandler, IDxcResult,
@@ -80,7 +82,7 @@ pub(crate) fn compile(source: &str, entry: &str, target: &str) -> windows::core:
 /// Whether the container holds the root signature the shader asked for: both
 /// compilers store it as the chunk `RTS0`.
 fn carries_root_signature(bytes: &[u8]) -> bool {
-    bytes.windows(4).any(|chunk| chunk == b"RTS0")
+    Container::parse(bytes).is_ok_and(|container| container.part(FourCC::RTS0).is_some())
 }
 
 /// Whether the declaration of `entry` asks for a root signature. A source can
@@ -424,6 +426,23 @@ float4 lit() : SV_Target { return 1.0; }
             "float4 lit() : SV_Target { return 1.0; }",
             "lit"
         ));
+    }
+
+    #[test]
+    fn only_a_root_signature_part_triggers_detection() {
+        let mut bytes = [0u8; 48];
+        bytes[..4].copy_from_slice(b"DXBC");
+        bytes[24..28].copy_from_slice(&48u32.to_le_bytes());
+        bytes[28..32].copy_from_slice(&1u32.to_le_bytes());
+        bytes[32..36].copy_from_slice(&36u32.to_le_bytes());
+        bytes[36..40].copy_from_slice(b"STAT");
+        bytes[40..44].copy_from_slice(&4u32.to_le_bytes());
+        bytes[44..48].copy_from_slice(b"RTS0");
+        assert!(!carries_root_signature(&bytes));
+
+        bytes[36..40].copy_from_slice(b"RTS0");
+        assert!(carries_root_signature(&bytes));
+        assert!(!carries_root_signature(&bytes[..44]));
     }
 
     /// A shader with no root signature of its own keeps the system's bytes:
