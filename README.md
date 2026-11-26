@@ -232,6 +232,12 @@ dedicated directory for each run. If Wine is terminated before it can release
 the mappings, files can remain on disk. Remove those files after the run and
 its Wine processes have exited.
 
+With that directory configured, `VICTORY_PHYSICAL_PAGEFILE_FIRST_MB` enables
+a shared Wine pagefile budget in MiB for early physical-page sections. Sections
+that exceed the remaining allowance use temporary files. This can reduce file
+I/O while increasing memory use that cannot be reclaimed through the backing
+filesystem. The budget applies to the entire process and defaults to zero.
+
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
 copy victory.example.toml victory.toml   # then set your paths (outside the repo)

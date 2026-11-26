@@ -342,7 +342,47 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
+// Charge each successful section for the lifetime of the process. A mapped
+// view can keep its backing alive after the title frees the page numbers.
+static PHYSICAL_PAGEFILE_REMAINING: LazyLock<AtomicUsize> = LazyLock::new(|| {
+    let bytes = std::env::var("VICTORY_PHYSICAL_PAGEFILE_FIRST_MB")
+        .ok()
+        .and_then(|mib| mib.parse::<usize>().ok())
+        .and_then(|mib| mib.checked_mul(MIB))
+        .unwrap_or(0);
+    AtomicUsize::new(bytes)
+});
+
+fn reserve_pagefile(remaining: &AtomicUsize, size: usize) -> bool {
+    remaining
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bytes| {
+            bytes.checked_sub(size)
+        })
+        .is_ok()
+}
+
 struct Section(HANDLE);
+
+impl Section {
+    fn create(size: usize, storage: HANDLE, protection: u32) -> std::io::Result<Self> {
+        // SAFETY: callers supply a live writable file or the pagefile
+        // sentinel. The new section holds its own reference to the storage.
+        let handle = unsafe {
+            CreateFileMappingW(
+                storage,
+                std::ptr::null(),
+                protection,
+                (size as u64 >> 32) as u32,
+                size as u32,
+                std::ptr::null(),
+            )
+        };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self(handle))
+    }
+}
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -403,41 +443,35 @@ fn physical() -> MutexGuard<'static, Physical> {
 fn physical_section(size: usize) -> std::io::Result<Section> {
     use std::os::windows::io::AsRawHandle;
     let wine = on_wine();
-    let file = match wine.then(|| std::env::var_os("VICTORY_PHYSICAL_BACKING_DIR")).flatten() {
-        Some(directory) => {
-            let directory = std::path::Path::new(&directory);
-            victory_core::ensure_outside_repo(directory).map_err(std::io::Error::other)?;
-            Some(tempfile::tempfile_in(directory)?)
+    if let Some(directory) = wine
+        .then(|| std::env::var_os("VICTORY_PHYSICAL_BACKING_DIR"))
+        .flatten()
+    {
+        let directory = std::path::Path::new(&directory);
+        victory_core::ensure_outside_repo(directory).map_err(std::io::Error::other)?;
+        if reserve_pagefile(&PHYSICAL_PAGEFILE_REMAINING, size) {
+            match Section::create(size, INVALID_HANDLE_VALUE, PAGE_READWRITE | SEC_COMMIT) {
+                Ok(section) => {
+                    tracing::info!(bytes = size, "physical pages use budgeted pagefile backing");
+                    return Ok(section);
+                }
+                Err(error) => {
+                    PHYSICAL_PAGEFILE_REMAINING.fetch_add(size, Ordering::Relaxed);
+                    tracing::warn!(bytes = size, %error, "pagefile backing failed; using a temporary file");
+                }
+            }
         }
-        None => None,
-    };
-    let storage = file.as_ref().map_or(INVALID_HANDLE_VALUE, |f| f.as_raw_handle());
-    let protection = if file.is_some() {
-        PAGE_READWRITE
-    } else if wine {
+        let file = tempfile::tempfile_in(directory)?;
+        let section = Section::create(size, file.as_raw_handle(), PAGE_READWRITE)?;
+        tracing::info!(bytes = size, "physical pages use temporary file backing");
+        return Ok(section);
+    }
+    let protection = if wine {
         PAGE_READWRITE | SEC_COMMIT
     } else {
         PAGE_READWRITE | SEC_RESERVE
     };
-    // SAFETY: storage is a live writable file or the pagefile sentinel. The
-    // new section holds its own reference to the storage.
-    let handle = unsafe {
-        CreateFileMappingW(
-            storage,
-            std::ptr::null(),
-            protection,
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
-    };
-    if handle.is_null() {
-        return Err(std::io::Error::last_os_error());
-    }
-    if file.is_some() {
-        tracing::info!(bytes = size, "physical pages use temporary file backing");
-    }
-    Ok(Section(handle))
+    Section::create(size, INVALID_HANDLE_VALUE, protection)
 }
 
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
@@ -1061,6 +1095,16 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_pagefile_sections_share_a_fixed_budget() {
+        let remaining = AtomicUsize::new(4 * PAGE);
+        assert!(!reserve_pagefile(&remaining, 5 * PAGE));
+        assert!(reserve_pagefile(&remaining, 3 * PAGE));
+        assert!(!reserve_pagefile(&remaining, 2 * PAGE));
+        assert!(reserve_pagefile(&remaining, PAGE));
+        assert!(!reserve_pagefile(&remaining, PAGE));
+    }
 
     fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.
