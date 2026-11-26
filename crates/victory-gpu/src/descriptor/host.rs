@@ -5110,6 +5110,50 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!(heap.made_get(1), key2, "direct mirror must not be reverted by stale copied words");
     }
 
+    #[test]
+    fn stale_copied_slice_does_not_replace_a_repeated_direct_view() {
+        let heap = HostHeap::new(false, 8).expect("D3D12 host for descriptor regression");
+        let mut record = [0u32; 8];
+        let handle = record.as_mut_ptr() as u64;
+        crate::descriptor::create_srv(
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            handle,
+        );
+        let (_, original_key) = crate::descriptor::view_and_key(handle).unwrap();
+        assert!(heap.mirror(1, handle, true).is_some());
+        assert_eq!(heap.made_get(1), original_key);
+        let original = record;
+
+        // Read the epoch and an intermediate record as sync_heaps does.
+        let epochs = heap.made_shard_epochs();
+        crate::descriptor::create_uav(
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            handle,
+        );
+        let (_, intermediate_key) = crate::descriptor::view_and_key(handle).unwrap();
+        assert_ne!(intermediate_key, original_key);
+        let intermediate = [record[0], record[1], record[2]];
+
+        // The title restores the already-made view. A direct mirror of it
+        // succeeds without changing the host slot.
+        record.copy_from_slice(&original);
+        assert_eq!(crate::descriptor::view_and_key(handle).unwrap().1, original_key);
+        assert!(heap.mirror(1, handle, true).is_some());
+        assert_eq!(heap.made_get(1), original_key);
+
+        heap.mirror_inner(1, handle, false, Some(intermediate), Some(epochs[1]));
+        assert_eq!(
+            heap.made_get(1),
+            original_key,
+            "an intermediate copied record must not replace the restored live view"
+        );
+    }
+
     /// `VICTORY_STALE_TEXTURES=0`: nothing is ever stale, and a view that
     /// overlaps others is left out of the spans, as before.
     #[test]
