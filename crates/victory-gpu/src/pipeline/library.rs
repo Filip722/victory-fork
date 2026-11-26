@@ -506,11 +506,10 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     // RenderDoc's device refused the card's library, an empty one was
     // saved over 366 MB of built pipelines, and the next run drew black
     // until they were built again).
-    if rejected && let Some(dir) = DIR.get() {
-        if let Err(e) = std::fs::rename(dir.join(LIBRARY_FILE), dir.join(REJECTED_FILE)) {
+    if rejected && let Some(dir) = DIR.get()
+        && let Err(e) = std::fs::rename(dir.join(LIBRARY_FILE), dir.join(REJECTED_FILE)) {
             tracing::warn!(error = %e, "the rejected host pipeline library could not be kept under its other name");
         }
-    }
     // An empty library is asked for with no blob at all, which `make` cannot
     // say: an empty slice still has an address, and vkd3d-proton refuses an
     // address with no bytes behind it. That left it with no library at all.
