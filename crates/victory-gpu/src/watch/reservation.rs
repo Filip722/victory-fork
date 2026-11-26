@@ -51,9 +51,11 @@ pub(super) fn covered(j: &Journal, first: usize, last: usize) -> bool {
 
 fn region(page: usize) -> Option<(usize, usize, bool)> {
     use windows_sys::Win32::System::Memory::{
-        MemoryRegionInfo, QueryVirtualMemoryInformation, WIN32_MEMORY_REGION_INFORMATION,
+        MEM_PRIVATE, MEMORY_BASIC_INFORMATION, MemoryRegionInfo, QueryVirtualMemoryInformation,
+        VirtualQuery, WIN32_MEMORY_REGION_INFORMATION,
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let address = page.checked_mul(PAGE)? as *const _;
     let mut info = WIN32_MEMORY_REGION_INFORMATION::default();
     if stats() {
         STATS[2].fetch_add(1, Relaxed);
@@ -62,7 +64,7 @@ fn region(page: usize) -> Option<(usize, usize, bool)> {
     if unsafe {
         QueryVirtualMemoryInformation(
             GetCurrentProcess(),
-            page.checked_mul(PAGE)? as *const _,
+            address,
             MemoryRegionInfo,
             (&raw mut info).cast(),
             size_of_val(&info),
@@ -75,11 +77,24 @@ fn region(page: usize) -> Option<(usize, usize, bool)> {
     let base = info.AllocationBase as usize;
     let end = base.checked_add(info.RegionSize)?;
     // SAFETY: a successful query initialized the union flags.
-    Some((
-        base.div_ceil(PAGE),
-        end / PAGE,
-        unsafe { info.Anonymous.Flags } & 1 != 0,
-    ))
+    let flags = unsafe { info.Anonymous.Flags };
+    let private = if flags == 0 {
+        // Wine reports the reservation bounds but leaves RegionType unset.
+        // Confirm that the requested address is private in the same allocation.
+        let mut basic = MEMORY_BASIC_INFORMATION::default();
+        if stats() {
+            STATS[2].fetch_add(1, Relaxed);
+        }
+        // SAFETY: query only; the writable buffer has the required type and size.
+        let size = size_of_val(&basic);
+        let returned = unsafe { VirtualQuery(address, &mut basic, size) };
+        returned == size
+            && basic.AllocationBase == info.AllocationBase
+            && basic.Type == MEM_PRIVATE
+    } else {
+        flags & 1 != 0
+    };
+    Some((base.div_ceil(PAGE), end / PAGE, private))
 }
 
 fn can_join(first: usize, last: usize, next: (usize, usize)) -> bool {
