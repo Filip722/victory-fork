@@ -1,3 +1,18 @@
+#[test]
+#[ignore = "requires a D3D12 adapter with the card copy helpers"]
+fn runtime_card_copy_shaders_build() {
+    let host = super::host().expect("a D3D12 device");
+    let work = host.make_card_work().expect("the card hash compare pipeline");
+    assert!(
+        host.make_card_compare_wide(&work.root).is_some(),
+        "the wide card hash compare pipeline"
+    );
+    assert!(
+        host.make_card_inflight(1 << 20).is_some(),
+        "the in-flight card fetch pipeline"
+    );
+}
+
 /// Run once with VICTORY_CARD_SYNC_BATCH=0 and once with it set to 1.
 #[test]
 #[ignore = "requires a D3D12 adapter and the card hash pipeline; run alone"]
