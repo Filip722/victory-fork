@@ -29,10 +29,7 @@
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
 //! the title needs more.
 
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::core::s;
 
 use crate::host::{HostList, host, transition};
 
@@ -301,43 +298,10 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
 /// replaced).
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
-    let mut code: Option<ID3DBlob> = None;
-    let mut errors: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; out pointers ours.
-    let compiled = unsafe {
-        D3DCompile(
-            source.as_ptr().cast(),
-            source.len(),
-            s!("clamp"),
-            None,
-            None,
-            s!("main"),
-            s!("cs_5_1"),
-            0,
-            0,
-            &mut code,
-            Some(&mut errors),
-        )
-    };
-    if let Err(e) = compiled {
-        if let Some(errors) = errors {
-            // SAFETY: the blob's own bytes.
-            let text = unsafe {
-                std::slice::from_raw_parts(
-                    errors.GetBufferPointer().cast::<u8>(),
-                    errors.GetBufferSize(),
-                )
-            };
-            tracing::warn!("argument clamp: {}", String::from_utf8_lossy(text));
-        }
-        return Err(e);
-    }
-    let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
+    let bytes = crate::dxc::compile(source, "main", "cs_5_1")?;
+    // SAFETY: the shader bytecode owns the embedded root signature.
     unsafe {
-        let bytes =
-            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+        let root: ID3D12RootSignature = device.CreateRootSignature(0, &bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
@@ -1454,14 +1418,35 @@ void main() {
 
     impl WarpHarness {
         fn new() -> Option<Self> {
-            // SAFETY: plain DXGI WARP query and D3D12 test harness setup.
+            let hardware = std::env::var_os("VICTORY_INDIRECT_TEST_HARDWARE").is_some_and(|v| v == "1");
+            let harness = Self::on_adapter(hardware);
+            if hardware {
+                assert!(
+                    harness.is_some(),
+                    "the requested physical D3D12 fixture is unavailable"
+                );
+            }
+            harness
+        }
+
+        fn on_adapter(hardware: bool) -> Option<Self> {
+            // SAFETY: plain DXGI adapter query and D3D12 test harness setup.
             unsafe {
                 let factory: IDXGIFactory4 =
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
-                let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
+                let adapter: IDXGIAdapter = if hardware {
+                    factory.EnumAdapters(0).ok()?
+                } else {
+                    factory.EnumWarpAdapter().ok()?
+                };
                 let desc = adapter.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()?;
-                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+                let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
+                if hardware == software {
                     return None;
+                }
+                if hardware {
+                    let name = String::from_utf16_lossy(&desc.Description);
+                    eprintln!("indirect test adapter: {}", name.trim_end_matches('\0'));
                 }
                 let mut device: Option<ID3D12Device> = None;
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
@@ -1616,28 +1601,10 @@ void main() {
     }
 
     fn compile_cs(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
-        let mut code: Option<ID3DBlob> = None;
-        // SAFETY: source and entry names outlive `D3DCompile`.
+        let bytes = crate::host::compile(source, "main", "cs_5_1")?;
+        // SAFETY: the compiled container keeps the root signature and shader bytes alive.
         unsafe {
-            D3DCompile(
-                source.as_ptr().cast(),
-                source.len(),
-                s!("worker"),
-                None,
-                None,
-                s!("main"),
-                s!("cs_5_1"),
-                0,
-                0,
-                &mut code,
-                None,
-            )?;
-            let code = code.unwrap();
-            let bytes = std::slice::from_raw_parts(
-                code.GetBufferPointer().cast::<u8>(),
-                code.GetBufferSize(),
-            );
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, &bytes)?;
             let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 CS: D3D12_SHADER_BYTECODE {
@@ -2996,7 +2963,7 @@ mod bare_cost {
     use windows::Win32::Graphics::Dxgi::Common::*;
     use windows::Win32::Graphics::Dxgi::*;
     use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
-    use windows::core::{Interface, s};
+    use windows::core::Interface;
 
     use crate::host::{compile, transition};
 
@@ -3219,12 +3186,12 @@ void work() {
         /// The default adapter, as the layer takes it; `None` without one
         /// or on a software adapter.
         fn new() -> Option<Self> {
-            let vs = compile(DRAW, s!("corner"), s!("vs_5_1")).ok()?;
+            let vs = compile(DRAW, "corner", "vs_5_1").ok()?;
             let ps = [
-                compile(DRAW, s!("first"), s!("ps_5_1")).ok()?,
-                compile(DRAW, s!("second"), s!("ps_5_1")).ok()?,
+                compile(DRAW, "first", "ps_5_1").ok()?,
+                compile(DRAW, "second", "ps_5_1").ok()?,
             ];
-            let cs = compile(WORK, s!("work"), s!("cs_5_1")).ok()?;
+            let cs = compile(WORK, "work", "cs_5_1").ok()?;
             // SAFETY: plain object creation on a device of our own; the
             // views are made in heaps that live as long as the rig.
             unsafe {
