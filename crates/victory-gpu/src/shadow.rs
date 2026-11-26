@@ -4094,41 +4094,81 @@ impl Shadow {
                 .filter(|&(a, b)| a < at + n && b > at)
                 .collect()
         };
-        title.clear();
-        title.resize(n, 0);
-        // Who touched the page since its last store is looked at before our
-        // own read of it (`VICTORY_BACK_READS`): counted only.
         #[cfg(feature = "diagnostics")]
         let _reads_as = crate::backreads::reading_as(crate::backreads::MERGE, self.id);
-        #[cfg(feature = "diagnostics")]
-        crate::backreads::before(start + at);
-        let mapped = crate::host::read_into((start + at) as *const u8, title);
-        // The stretch as read: what the card did not change is the
-        // title's, and may have been written again since.
-        let as_read = (mapped && merge_race_on()).then(|| title.clone());
-        let mut changed = false;
+        let mut written = 0;
         for (a, b) in outside(at, at + n, skip) {
-            let (a, b) = (a - at, b - at);
-            // Title memory that is not mapped: the CPU's side keeps what
-            // the card wrote, as before; `title` is scratch then.
-            changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
+            let (from, to) = (a - at, b - at);
+            let (gpu, held) = (&gpu[from..to], &mut held[from..to]);
+            if let Some(bytes) = self.merge_card_relay_range(a, gpu, held, title) {
+                written += bytes;
+                continue;
+            }
+
+            // A read spanning an unmapped page fails as a whole. Retry
+            // within each page so writes to the neighboring pages land.
+            const OS_PAGE: usize = 4096;
+            let mut offset = 0;
+            while offset < gpu.len() {
+                let address = start + a + offset;
+                let len = (OS_PAGE - address % OS_PAGE).min(gpu.len() - offset);
+                let range = offset..offset + len;
+                let gpu = &gpu[range.clone()];
+                let held = &mut held[range];
+                match self.merge_card_relay_range(a + offset, gpu, held, title) {
+                    Some(bytes) => written += bytes,
+                    None => {
+                        // An unmapped page still advances the CPU copy.
+                        title.resize(len, 0);
+                        merge_piece(gpu, held, title);
+                    }
+                }
+                offset += len;
+            }
         }
-        if !mapped || !changed {
-            return 0;
-        }
-        crate::host::shaders_write(start + at, &title[..]);
-        if self.put_back_own(start + at, &title[..]) {
-            #[cfg(feature = "diagnostics")]
-            crate::backreads::stored(self.id, (self.start, self.len), start + at, n, true);
-            return n;
-        }
-        crate::watch::writing(start + at, n);
-        merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-        #[cfg(feature = "diagnostics")]
-        crate::backreads::stored(self.id, (self.start, self.len), start + at, n, false);
-        n
+        written
     }
+
+    /// Lands the bytes that changed in a contiguous part of a relay fetch.
+    /// Returns `None` when the read crosses inaccessible title memory.
+    fn merge_card_relay_range(
+        &self,
+        at: usize,
+        gpu: &[u8],
+        held: &mut [u8],
+        title: &mut Vec<u8>,
+    ) -> Option<usize> {
+        let Some(first) = first_difference(gpu, held) else {
+            return Some(0);
+        };
+        let last = last_difference(gpu, held).unwrap_or(first);
+        let address = self.start as usize + at + first;
+        let n = last + 1 - first;
+        title.clear();
+        title.resize(n, 0);
+        #[cfg(feature = "diagnostics")]
+        crate::backreads::before(address);
+        if !crate::host::read_into(address as *const u8, title) {
+            return None;
+        }
+        let as_read = merge_race_on().then(|| title.clone());
+        if !merge_piece(&gpu[first..=last], &mut held[first..=last], title) {
+            return Some(0);
+        }
+        crate::host::shaders_write(address, title);
+        if self.put_back_own(address, title) {
+            #[cfg(feature = "diagnostics")]
+            crate::backreads::stored(self.id, (self.start, self.len), address, n, true);
+            return Some(n);
+        }
+        crate::watch::writing(address, n);
+        merge_race(as_read.as_deref(), (self.start, self.len), address, title, "card relay");
+        crate::host::write_mapped(address as *mut u8, title.as_ptr(), n);
+        #[cfg(feature = "diagnostics")]
+        crate::backreads::stored(self.id, (self.start, self.len), address, n, false);
+        Some(n)
+    }
+
 }
 
 struct Entry {
@@ -4927,12 +4967,23 @@ mod card_merge_tests {
     /// A plain buffer on the software adapter: what a copy's `buffer` and
     /// its card's `staging` are; the merge never touches them.
     fn warp_buffer() -> Option<ID3D12Resource> {
-        // SAFETY: plain DXGI and D3D12 creation calls on the software adapter.
-        unsafe {
+        // SAFETY: plain DXGI calls to find the software adapter.
+        let adapter: IDXGIAdapter = unsafe {
             let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
-            let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
+            factory.EnumWarpAdapter().ok()?
+        };
+        merge_buffer(Some(&adapter))
+    }
+
+    fn merge_buffer(adapter: Option<&IDXGIAdapter>) -> Option<ID3D12Resource> {
+        // SAFETY: plain D3D12 calls to create a device and a test buffer.
+        unsafe {
             let mut device: Option<ID3D12Device> = None;
-            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut device).ok()?;
+            if let Some(adapter) = adapter {
+                D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, &mut device).ok()?;
+            } else {
+                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut device).ok()?;
+            }
             let device = device?;
             let heap = D3D12_HEAP_PROPERTIES {
                 Type: D3D12_HEAP_TYPE_DEFAULT,
@@ -4953,6 +5004,49 @@ mod card_merge_tests {
                 .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
                 .ok()?;
             buffer
+        }
+    }
+
+    #[test]
+    fn card_relay_delivers_writes_on_both_sides_of_an_unmapped_page() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE,
+            VirtualAlloc, VirtualFree,
+        };
+
+        const PAGE: usize = 4096;
+        const LEN: usize = 3 * PAGE;
+        const WRITES: [usize; 2] = [128, 2 * PAGE + 192];
+        let buffer = merge_buffer(None).expect("a hardware D3D12 buffer");
+        for skip_hole in [false, true] {
+            let mut side = vec![0; LEN];
+            let mut slot = vec![0; LEN];
+            for index in WRITES {
+                slot[index] = 0x91;
+            }
+            // SAFETY: this fixture owns the three-page reservation and
+            // commits only the surrounding pages.
+            unsafe {
+                let title = VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+                assert!(!title.is_null());
+                for index in [0, 2 * PAGE] {
+                    assert!(!VirtualAlloc(title.add(index).cast(), PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+                }
+                let mut shadow = Shadow::new(buffer.clone(), side.as_mut_ptr(), 0, title as u64, LEN as u64);
+                shadow.card = Some(Card {
+                    staging: buffer.clone(),
+                    before: Mutex::new(None),
+                    dirty: Mutex::new(if skip_hole { vec![(PAGE, 2 * PAGE)] } else { Vec::new() }),
+                    sent: Mutex::default(),
+                    size: 0,
+                    me: std::sync::OnceLock::new(),
+                });
+                let wrote = shadow.card_merge_relay(0, &slot, 0, &mut Vec::new());
+                let actual = WRITES.map(|index| title.add(index).read());
+                drop(shadow);
+                assert_ne!(VirtualFree(title.cast(), 0, MEM_RELEASE), 0);
+                assert_eq!(actual, [0x91; 2], "skip={skip_hole}, wrote {wrote} bytes");
+            }
         }
     }
 
