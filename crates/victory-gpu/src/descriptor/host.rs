@@ -2625,9 +2625,9 @@ impl HostHeap {
         self.mirror_inner(index, handle, for_draw, None, None)
     }
 
-    /// Inner implementation of [`HostHeap::mirror`], reusing pre-copied record
-    /// words when available unless a direct mutation updated this shard since
-    /// `expected_epoch`, in which case the live 12-byte record is safely re-read.
+    /// Inner implementation of [`HostHeap::mirror`]. Copied words can confirm
+    /// an already-made slot without a lock. Any slot update reads the live
+    /// record while holding the shard lock.
     fn mirror_inner(
         &self,
         index: u32,
@@ -2687,23 +2687,23 @@ impl HostHeap {
             let at = (index / KEPT_PIECES) as usize;
             #[cfg(feature = "diagnostics")]
             let held = Held::start(for_draw);
-            let [tag, i, generation] = match (words, expected_epoch) {
-                (Some(_), Some(expected))
-                    if self.made_direct_epoch[shard].load(std::sync::atomic::Ordering::Acquire)
-                        != expected =>
-                {
-                    if let Some(last) = self.copied_slots().get(index as usize) {
+            let [tag, i, generation] = match words {
+                Some(copied) => {
+                    // A direct mirror can see a restored, already-made record
+                    // without advancing its epoch. Re-read before changing
+                    // the slot, and never dereference a copied range directly.
+                    let mut record = [0u8; 12];
+                    let live = crate::host::read_into(handle as *const u8, &mut record)
+                        .then(|| Self::record_words(&record).expect("12 bytes"));
+                    if live != Some(copied)
+                        && let Some(last) = self.copied_slots().get(index as usize)
+                    {
                         last.store(0, std::sync::atomic::Ordering::Relaxed);
                     }
-                    let mut fresh = [0u8; 12];
-                    if !crate::host::read_into(handle as *const u8, &mut fresh) {
-                        return None;
-                    }
-                    Self::record_words(&fresh).expect("12 bytes")
+                    live?
                 }
-                (Some(w), _) => w,
                 // SAFETY: the handle is a descriptor slot in title memory.
-                (None, _) => unsafe { (handle as *const [u32; 3]).read_unaligned() },
+                None => unsafe { (handle as *const [u32; 3]).read_unaligned() },
             };
             let key = u64::from(generation) << 32 | u64::from(i);
             let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
