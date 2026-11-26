@@ -206,7 +206,7 @@ mod tests {
         // Wine's stub can return zero without setting LastError.
         if subscription == 0
             && matches!(error, UNCHANGED | ERROR_CALL_NOT_IMPLEMENTED)
-            && crate::host::on_wine()
+            && crate::running_under_wine()
         {
             eprintln!("EvtSubscribe is unavailable on this Wine runtime");
             return;

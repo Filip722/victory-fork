@@ -2897,7 +2897,7 @@ mod tests {
         let first = map(0);
         let can_query_placeholders = match (placeholder_result(p / BLOCK + 1), placeholder_result(p / BLOCK + 3)) {
             (Ok(true), Ok(true)) => true,
-            (Err(STATUS_INVALID_INFO_CLASS), Err(STATUS_INVALID_INFO_CLASS)) if crate::host::on_wine() => false,
+            (Err(STATUS_INVALID_INFO_CLASS), Err(STATUS_INVALID_INFO_CLASS)) if crate::running_under_wine() => false,
             results => panic!("what is left of the placeholder: {results:?}"),
         };
         assert!(!placeholder(p / BLOCK), "a view is none");
