@@ -653,7 +653,14 @@ fn publish_saved(dir: &Path, tmp: &Path, bytes: usize, used: &[String]) -> std::
             )
         });
     }
-    library_written.and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
+    if library_written.is_err() && used.is_empty() {
+        // With no keys to publish, keep the existing early list as before.
+        return library_written;
+    }
+    // The early keys remain useful even if the native cache could not take
+    // either of its destinations. Attempt both writes and report any error.
+    let early_written = write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes());
+    library_written.and(early_written)
 }
 
 /// Writes the library's `size` serialised bytes to the file `tmp`: through
