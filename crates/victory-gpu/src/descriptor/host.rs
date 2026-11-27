@@ -1928,9 +1928,14 @@ impl HostHeap {
     /// [`TABLED_FRAMES`] frames before `frame` (never, if such slots are
     /// to be queued as any other).
     fn tabled_lately(&self, index: u32, frame: u64) -> bool {
+        self.tabled_age(index, frame).is_some()
+    }
+
+    fn tabled_age(&self, index: u32, frame: u64) -> Option<u64> {
         let stamp = self.tabled_stamp(index) & !TABLED_READ;
         let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
-        tabled_out() && stamp != 0 && u64::from(now.wrapping_sub(stamp)) <= TABLED_FRAMES
+        let age = u64::from(now.wrapping_sub(stamp));
+        (tabled_out() && stamp != 0 && age <= TABLED_FRAMES).then_some(age)
     }
 
     /// What `tabled` holds for title slot `index`; 0: never a table's.
@@ -2314,7 +2319,13 @@ impl HostHeap {
     /// `record`: the record's bytes as the caller read them (through the
     /// kernel, which fails on a page the title unmapped meanwhile where a
     /// read in place would fault: the title unmaps heap pages too).
-    pub(crate) fn mirror_copied(&self, index: u32, handle: u64, record: &[u8]) -> bool {
+    pub(crate) fn mirror_copied(
+        &self,
+        index: u32,
+        handle: u64,
+        record: &[u8],
+        retry_at: Option<&mut u64>,
+    ) -> bool {
         if index >= self.count {
             return false;
         }
@@ -2328,7 +2339,8 @@ impl HostHeap {
         // made and brought up to date once more by the pass over buffer
         // views (some 50 ms a frame). `VICTORY_HEAP_SYNC_TABLES=1`: they
         // are mirrored too, as in run 200.
-        if !sync_tables() && self.tabled_lately(index, crate::frame::current()) {
+        let tables = sync_tables();
+        if retry_at.is_none() && !tables && self.tabled_lately(index, crate::frame::current()) {
             COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return false;
         }
@@ -2349,6 +2361,14 @@ impl HostHeap {
             // A slot never looked at that holds nothing: as it was.
             if *last == print || (*last == 0 && record[..n].iter().all(|&b| b == 0)) {
                 return false;
+            }
+            if !tables && let Some(at) = retry_at {
+                let frame = crate::frame::current();
+                if let Some(age) = self.tabled_age(index, frame) {
+                    *at = (*at).min(frame.saturating_add(TABLED_FRAMES + 1 - age));
+                    COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return false;
+                }
             }
             *last = print;
         }
@@ -2377,6 +2397,7 @@ impl HostHeap {
         (start, step): (u64, u64),
         from: usize,
         page: &[u8],
+        mut retry_at: Option<&mut u64>,
     ) -> (u64, u64) {
         let (frame, tables) = (crate::frame::current(), sync_tables());
         let mut looked = 0u64;
@@ -2409,9 +2430,12 @@ impl HostHeap {
                 if *last == print || (*last == 0 && record.iter().all(|&b| b == 0)) {
                     continue;
                 }
-                // A table's slot lately: left to its draws, and looked at
-                // again next time.
-                if !tables && self.tabled_lately(index as u32, frame) {
+                // A table's slot lately: left to its draws. With the retry
+                // enabled, the page is read again when the stamp can expire.
+                if !tables && let Some(age) = self.tabled_age(index as u32, frame) {
+                    if let Some(at) = retry_at.as_deref_mut() {
+                        *at = (*at).min(frame.saturating_add(TABLED_FRAMES + 1 - age));
+                    }
                     COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     continue;
                 }
