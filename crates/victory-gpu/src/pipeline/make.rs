@@ -267,22 +267,42 @@ fn compute_cap() -> std::time::Duration {
     }))
 }
 
-/// The frame whose compute waits are counted, and the microseconds counted.
-static COMPUTE_WAITED: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new((0, 0));
+/// Completed compute waits for the newest frame seen by dispatches.
+struct ComputeBudget {
+    frame: u64,
+    waited_us: u64,
+}
+
+impl ComputeBudget {
+    fn room(&mut self, frame: u64, cap: Duration) -> bool {
+        // A recording thread may have read its token before a newer frame
+        // reached this budget. Only a newer token can reset the count.
+        if frame > self.frame {
+            *self = Self { frame, waited_us: 0 };
+        }
+        frame == self.frame && u128::from(self.waited_us) < cap.as_micros()
+    }
+
+    fn record(&mut self, frame: u64, took: Duration) {
+        if frame == self.frame {
+            self.waited_us = self.waited_us.saturating_add(u64::try_from(took.as_micros()).unwrap_or(u64::MAX));
+        }
+    }
+}
+
+static COMPUTE_WAITED: Mutex<ComputeBudget> = Mutex::new(ComputeBudget { frame: 0, waited_us: 0 });
 
 /// Whether frame `frame` may still wait for a compute pipeline ([`compute_cap`]).
 fn compute_room(frame: u64) -> bool {
-    let mut w = COMPUTE_WAITED.lock().unwrap_or_else(|e| e.into_inner());
-    if w.0 != frame {
-        *w = (frame, 0);
-    }
-    let room = u128::from(w.1) < compute_cap().as_micros();
-    if !room {
-        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let cap = compute_cap();
+    let mut waited = COMPUTE_WAITED.lock().unwrap_or_else(|e| e.into_inner());
+    let room = waited.room(frame, cap);
+    if !room && waited.frame == frame {
+        static SAID: AtomicBool = AtomicBool::new(false);
         if !SAID.swap(true, Ordering::Relaxed) {
             tracing::warn!(
                 frame,
-                cap_ms = u64::try_from(compute_cap().as_millis()).unwrap_or(u64::MAX),
+                cap_ms = u64::try_from(cap.as_millis()).unwrap_or(u64::MAX),
                 "a frame waited its cap for compute pipelines; the rest wait within its budget (said once)"
             );
         }
@@ -291,11 +311,8 @@ fn compute_room(frame: u64) -> bool {
 }
 
 /// Counts a compute wait to `frame`, if that is still the frame counted.
-fn compute_spent(frame: u64, took: std::time::Duration) {
-    let mut w = COMPUTE_WAITED.lock().unwrap_or_else(|e| e.into_inner());
-    if w.0 == frame {
-        w.1 = w.1.saturating_add(u64::try_from(took.as_micros()).unwrap_or(u64::MAX));
-    }
+fn compute_spent(frame: u64, took: Duration) {
+    COMPUTE_WAITED.lock().unwrap_or_else(|e| e.into_inner()).record(frame, took);
 }
 
 /// Pipelines made again for the formats bound at a draw, since the start.
@@ -567,6 +584,25 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_compute_waits_do_not_change_the_newer_frames_budget() {
+        let mut budget = ComputeBudget { frame: 0, waited_us: 0 };
+        let cap = Duration::from_secs(8);
+        assert!(budget.room(600, cap));
+        assert!(budget.room(601, cap));
+
+        // A make from frame 600 returned after frame 601 started.
+        budget.record(600, cap);
+        assert!(budget.room(601, cap));
+        budget.record(601, cap);
+        assert!(!budget.room(601, cap));
+
+        // A caller sampled frame 600 but reached the budget after frame 601.
+        assert!(!budget.room(600, cap));
+        assert!(!budget.room(601, cap));
+        assert!(budget.room(602, cap));
+    }
 
     #[test]
     fn a_panicking_pipeline_is_refused_and_the_worker_continues() {
