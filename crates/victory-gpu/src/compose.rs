@@ -16,8 +16,11 @@
 use std::sync::OnceLock;
 
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
+
+use victory_shader::dxbc::{Container, FourCC};
 
 use crate::host::{compile, transition};
 
@@ -80,20 +83,110 @@ fn view_format(format: DXGI_FORMAT) -> DXGI_FORMAT {
     }
 }
 
+#[cfg(test)]
+fn report_shader(stage: &str, bytes: &[u8]) {
+    let container = Container::parse(bytes).expect("the compiler returned a shader container");
+    let format = if container.part(FourCC::DXIL).is_some() {
+        "DXIL"
+    } else {
+        "DXBC"
+    };
+    let embedded_root = container.part(FourCC::RTS0).is_some();
+    eprintln!("compositor {stage} returned {format}, embedded root signature: {embedded_root}");
+}
+
+/// Serializes the layout described by `RS` for system-compiled bytecode
+/// whose container omitted it.
+fn serialized_root(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSignature> {
+    let ranges = [D3D12_DESCRIPTOR_RANGE {
+        RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+        NumDescriptors: 2,
+        OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+        ..Default::default()
+    }];
+    let parameters = [
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                    NumDescriptorRanges: ranges.len() as u32,
+                    pDescriptorRanges: ranges.as_ptr(),
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+        },
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: 0,
+                    Num32BitValues: 1,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+        },
+    ];
+    let samplers = [D3D12_STATIC_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        MaxAnisotropy: 16,
+        ComparisonFunc: D3D12_COMPARISON_FUNC_LESS_EQUAL,
+        BorderColor: D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE,
+        MaxLOD: f32::MAX,
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+        ..Default::default()
+    }];
+    let desc = D3D12_ROOT_SIGNATURE_DESC {
+        NumParameters: parameters.len() as u32,
+        pParameters: parameters.as_ptr(),
+        NumStaticSamplers: samplers.len() as u32,
+        pStaticSamplers: samplers.as_ptr(),
+        Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+    };
+    let mut blob: Option<ID3DBlob> = None;
+    // SAFETY: desc references the live bindings. The blob owns its bytes.
+    unsafe {
+        D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None)?;
+        let blob = blob.ok_or_else(windows::core::Error::empty)?;
+        let bytes =
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+        device.CreateRootSignature(0, bytes)
+    }
+}
+
 impl Compose {
     /// The pass for back buffers of `format`.
     pub(crate) fn new(device: &ID3D12Device, format: DXGI_FORMAT) -> windows::core::Result<Compose> {
         use windows::core::s;
+        #[cfg(test)]
+        eprintln!("compositor compiling vertex shader");
         let vs = compile(SOURCE, s!("corner"), s!("vs_5_1"))?;
+        #[cfg(test)]
+        report_shader("vertex shader", &vs);
+        #[cfg(test)]
+        eprintln!("compositor compiling pixel shader");
         let ps = compile(SOURCE, s!("blend"), s!("ps_5_1"))?;
+        #[cfg(test)]
+        report_shader("pixel shader", &ps);
         let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
             pShaderBytecode: bytes.as_ptr().cast(),
             BytecodeLength: bytes.len(),
         };
-        // SAFETY: the root signature is inside the pixel shader; the
-        // description points at live data and never releases its pointer.
+        // SAFETY: the description points at live data and never releases
+        // its pointer.
         unsafe {
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, &ps[..])?;
+            let has_embedded_root =
+                Container::parse(&ps).is_ok_and(|container| container.part(FourCC::RTS0).is_some());
+            let root: ID3D12RootSignature = if has_embedded_root {
+                device.CreateRootSignature(0, &ps[..])?
+            } else {
+                serialized_root(device)?
+            };
+            #[cfg(test)]
+            eprintln!("compositor created the root signature, embedded: {has_embedded_root}");
             let mut formats = [DXGI_FORMAT_UNKNOWN; 8];
             formats[0] = format;
             let mut blend = D3D12_BLEND_DESC::default();
@@ -241,3 +334,6 @@ impl Compose {
         }
     }
 }
+
+#[cfg(test)]
+mod readback;
