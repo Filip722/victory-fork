@@ -864,7 +864,7 @@ void main() {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        let compare = compile_cs(&warp.device, crate::host::card_compare::CARD_COMPARE).expect("the card compare must compile on WARP");
         const PIECE: usize = 64 << 10;
         const PIECES: u32 = 3;
         let size = PIECE * PIECES as usize;
@@ -941,7 +941,7 @@ void main() {
             return;
         };
         let other = std::env::var("VICTORY_BENCH_CS").ok().map(|f| std::fs::read_to_string(f).unwrap());
-        let source: &'static str = other.map_or(crate::host::CARD_COMPARE, |s| Box::leak(s.into_boxed_str()));
+        let source: &'static str = other.map_or(crate::host::card_compare::CARD_COMPARE, |s| Box::leak(s.into_boxed_str()));
         let walked_alone = source.contains("SV_DispatchThreadID");
         let compare = compile_cs(&gpu.device, source).expect("the compare must compile");
         let now = gpu.default_uav(256 << 20);
