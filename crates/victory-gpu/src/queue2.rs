@@ -630,7 +630,7 @@ void main() {
 }
 "#;
 
-    /// The software adapter with a direct queue and the copy queues.
+    /// A test device with a direct queue and the copy queues.
     struct Warp {
         device: ID3D12Device,
         direct: ID3D12CommandQueue,
@@ -657,7 +657,37 @@ void main() {
                 }
                 let mut device: Option<ID3D12Device> = None;
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
-                let device = device?;
+                Self::with_device(bits, device?, false)
+            }
+        }
+
+        fn hardware(bits: u32) -> Self {
+            let device = crate::host::host().expect("the requested runtime D3D12 device").device.clone();
+            // SAFETY: querying the adapter LUID and description of this live device.
+            let desc = unsafe {
+                CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                    .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()))
+                    .and_then(|adapter| adapter.GetDesc1())
+                    .expect("the runtime D3D12 adapter description")
+            };
+            let name = String::from_utf16_lossy(&desc.Description);
+            eprintln!(
+                "copy lane fixture adapter: {}, vendor {:#06x}, device {:#06x}",
+                name.trim_end_matches('\0'),
+                desc.VendorId,
+                desc.DeviceId
+            );
+            assert_eq!(
+                desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32,
+                0,
+                "the hardware fixture requires a physical D3D12 adapter"
+            );
+            Self::with_device(bits, device, true).expect("physical D3D12 copy-lane fixture setup")
+        }
+
+        fn with_device(bits: u32, device: ID3D12Device, hardware: bool) -> Option<Self> {
+            // SAFETY: plain queue, fence, compiler and pipeline creation on the live device.
+            unsafe {
                 let direct: ID3D12CommandQueue = device
                     .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
                         Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -668,7 +698,7 @@ void main() {
                 let event = CreateEventW(None, false, false, None).ok()?;
                 // The clocks' threads live as long as the process: the
                 // queues of a test are kept for them.
-                let second: &'static Second = Box::leak(Box::new(Second::new(&device, bits).expect("copy queues on WARP")));
+                let second: &'static Second = Box::leak(Box::new(Second::new(&device, bits).expect("D3D12 copy queues")));
                 second.clocked();
                 let mut code: Option<ID3DBlob> = None;
                 D3DCompile(
@@ -684,10 +714,26 @@ void main() {
                     &mut code,
                     None,
                 )
-                .expect("the test's shader compiles");
+                .expect("copy lane fixture D3DCompile cs_5_1");
                 let code = code?;
                 let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-                let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes).ok()?;
+                if hardware {
+                    use victory_shader::dxbc::{Container, FourCC};
+                    let container = Container::parse(bytes).expect("compiled copy-lane shader container");
+                    eprintln!(
+                        "copy lane fixture compiler returned {}, embedded root signature: {}",
+                        if container.part(FourCC::DXIL).is_some() { "DXIL" } else { "DXBC" },
+                        container.part(FourCC::RTS0).is_some()
+                    );
+                }
+                let root: ID3D12RootSignature = device
+                    .CreateRootSignature(0, bytes)
+                    .inspect_err(|e| {
+                        if hardware {
+                            eprintln!("copy lane fixture CreateRootSignature: {e}");
+                        }
+                    })
+                    .ok()?;
                 let pso: ID3D12PipelineState = device
                     .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                         pRootSignature: std::mem::transmute_copy(&root),
@@ -696,6 +742,11 @@ void main() {
                             BytecodeLength: bytes.len(),
                         },
                         ..Default::default()
+                    })
+                    .inspect_err(|e| {
+                        if hardware {
+                            eprintln!("copy lane fixture CreateComputePipelineState: {e}");
+                        }
                     })
                     .ok()?;
                 Some(Warp {
@@ -805,7 +856,7 @@ void main() {
             assert!(
                 // SAFETY: a plain query.
                 unsafe { self.device.GetDeviceRemovedReason() }.is_ok(),
-                "the software adapter lost the device"
+                "the copy-lane test adapter lost the device"
             );
             self.flown.clear();
         }
@@ -1045,9 +1096,13 @@ void main() {
         warp.land();
     }
 
+    /// WARP by default. Set `VICTORY_TEST_QUEUE2_HARDWARE=1` to require
+    /// the physical adapter the runtime selects for this test alone.
     #[test]
     fn warp_copy_lane_keeps_four_blocked_batches_distinct() {
-        let mut warp = Warp::new(1).expect("WARP copy queues");
+        let hardware = std::env::var_os("VICTORY_TEST_QUEUE2_HARDWARE").is_some_and(|value| value == "1");
+        let mut warp = if hardware { Warp::hardware(1) } else { Warp::new(1).expect("WARP copy queues") };
+        let mut readbacks = 0;
         let (source, _) = warp.buffer(64 << 10, false);
         let outputs: Vec<_> = (0..4).map(|_| warp.buffer(64 << 10, true)).collect();
         // SAFETY: the gate belongs to this rig and is signalled by the CPU.
@@ -1082,7 +1137,10 @@ void main() {
             for ((_, ptr), expected) in outputs.iter().zip(values) {
                 // SAFETY: CPU-visible buffer; all GPU jobs are fenced.
                 assert_eq!(unsafe { ptr.cast::<u32>().read_volatile() }, expected);
+                readbacks += 1;
             }
         }
+        assert_eq!(readbacks, 32);
+        eprintln!("copy lane fixture matched {readbacks} readbacks");
     }
 }
