@@ -568,6 +568,10 @@ pub(crate) fn line(frames: f64) {
 }
 
 #[cfg(test)]
+#[path = "queue2/test_dxc.rs"]
+mod test_dxc;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
@@ -701,22 +705,29 @@ void main() {
                 let second: &'static Second = Box::leak(Box::new(Second::new(&device, bits).expect("D3D12 copy queues")));
                 second.clocked();
                 let mut code: Option<ID3DBlob> = None;
-                D3DCompile(
-                    SLOW_STORE.as_ptr().cast(),
-                    SLOW_STORE.len(),
-                    s!("slow store"),
-                    None,
-                    None,
-                    s!("main"),
-                    s!("cs_5_1"),
-                    0,
-                    0,
-                    &mut code,
-                    None,
-                )
-                .expect("copy lane fixture D3DCompile cs_5_1");
-                let code = code?;
-                let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+                let fallback;
+                let bytes = if hardware {
+                    fallback = super::test_dxc::compile(SLOW_STORE, "main", "cs_5_1")
+                        .expect("copy lane fixture HLSL compile with DXC fallback");
+                    fallback.as_slice()
+                } else {
+                    D3DCompile(
+                        SLOW_STORE.as_ptr().cast(),
+                        SLOW_STORE.len(),
+                        s!("slow store"),
+                        None,
+                        None,
+                        s!("main"),
+                        s!("cs_5_1"),
+                        0,
+                        0,
+                        &mut code,
+                        None,
+                    )
+                    .expect("copy lane fixture D3DCompile cs_5_1");
+                    let code = code.as_ref()?;
+                    std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
+                };
                 if hardware {
                     use victory_shader::dxbc::{Container, FourCC};
                     let container = Container::parse(bytes).expect("compiled copy-lane shader container");
