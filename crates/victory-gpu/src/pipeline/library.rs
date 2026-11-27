@@ -48,7 +48,7 @@
 //! open (the test below). `VICTORY_LIBRARY_HANDLE=0`: closed, as before.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
 
@@ -620,7 +620,25 @@ pub(crate) fn save(now: bool) {
         used.iter().flatten().cloned().collect()
     };
     let bytes = bytes.unwrap_or(0);
-    let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
+    match publish_saved(dir, &tmp, bytes, &used) {
+        Ok(()) => tracing::info!(
+            bytes,
+            early = used.len(),
+            made = MADE.load(Ordering::Relaxed),
+            loaded = LOADED.load(Ordering::Relaxed),
+            started_early = EARLY.load(Ordering::Relaxed),
+            "host pipeline library saved"
+        ),
+        Err(e) => {
+            USED_CHANGED.store(true, Ordering::Relaxed);
+            tracing::warn!(error = %e, "host pipeline library not saved");
+        }
+    }
+}
+
+/// Publish the saved native bytes and early keys after serialisation.
+fn publish_saved(dir: &Path, tmp: &Path, bytes: usize, used: &[String]) -> std::io::Result<()> {
+    let library_written = if bytes > 0 { replace_library(dir, tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
         let in_place = !dir.join(NEXT_FILE).exists();
@@ -635,22 +653,7 @@ pub(crate) fn save(now: bool) {
             )
         });
     }
-    let written = library_written
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
-    match written {
-        Ok(()) => tracing::info!(
-            bytes,
-            early = used.len(),
-            made = MADE.load(Ordering::Relaxed),
-            loaded = LOADED.load(Ordering::Relaxed),
-            started_early = EARLY.load(Ordering::Relaxed),
-            "host pipeline library saved"
-        ),
-        Err(e) => {
-            USED_CHANGED.store(true, Ordering::Relaxed);
-            tracing::warn!(error = %e, "host pipeline library not saved");
-        }
-    }
+    library_written.and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
 }
 
 /// Writes the library's `size` serialised bytes to the file `tmp`: through
@@ -780,6 +783,30 @@ mod tests {
         save(true);
         let listed = std::fs::read_to_string(&path).expect("the early list after retry");
         assert!(listed.lines().any(|l| l == "early-list-test"), "{listed}");
+    }
+
+    #[test]
+    fn early_list_is_published_when_both_native_destinations_are_blocked() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        for name in [LIBRARY_FILE, NEXT_FILE] {
+            let blocked = dir.join(name);
+            std::fs::create_dir(&blocked).unwrap();
+            std::fs::write(blocked.join("keep"), b"blocks file replacement").unwrap();
+        }
+        let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
+        let native = b"serialized bytes";
+        std::fs::write(&tmp, native).unwrap();
+        let early = dir.join(EARLY_FILE);
+        std::fs::write(&early, b"older-key").unwrap();
+        assert!(publish_saved(dir, &tmp, native.len(), &[]).is_err());
+        assert_eq!(std::fs::read(&early).unwrap().as_slice(), b"older-key");
+        let keys = ["older-key".to_owned(), "new-key".to_owned()];
+
+        let result = publish_saved(dir, &tmp, native.len(), &keys);
+        assert!(result.is_err(), "native publication must report the error");
+        assert_eq!(std::fs::read(&tmp).unwrap().as_slice(), native);
+        assert_eq!(std::fs::read(&early).unwrap().as_slice(), b"older-key\nnew-key");
     }
 
     #[test]
